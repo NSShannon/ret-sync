@@ -39,7 +39,7 @@ from retsync.syncrays import Syncrays
 import retsync.rsconfig as rsconfig
 from retsync.rsconfig import rs_encode, rs_decode, rs_log, rs_debug, load_configuration
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QProcess
 
 import idc
@@ -72,6 +72,70 @@ if not os.path.exists(BROKER_PATH):
 os.environ['IDB_PATH'] = os.path.dirname(os.path.realpath(idaapi.get_path(idaapi.PATH_TYPE_IDB)))
 
 COL_CBTRACE = rsconfig.COL_CBTRACE
+
+
+# --------------------------------------------------------------------------
+
+
+# lines colored by the breakpoint feature via F2 with their original color
+# are kept in a netnode so they can be restored or recolored later
+class BpColors(object):
+
+    def __init__(self):
+        self.node = idaapi.netnode(rsconfig.NETNODE_BPCOL, 0, True)
+        self.color = rsconfig.load_bp_color()
+        self.marks = self.load()
+
+    def load(self):
+        blob = self.node.getblob(0, 'B')
+        if not blob:
+            return {}
+
+        try:
+            return {int(ea, 16): col for ea, col in json.loads(rs_decode(blob)).items()}
+        except ValueError:
+            rs_log('[-] failed to load breakpoint colors')
+            return {}
+
+    def save(self):
+        data = json.dumps({'0x%x' % ea: col for ea, col in self.marks.items()})
+        self.node.setblob(rs_encode(data), 0, 'B')
+
+    # the current pc line (prev_loc) is painted by cb_curline, holds
+    # the color to restore when pc moves away
+    def get(self, ea, prev_loc):
+        if prev_loc and prev_loc[0] == ea:
+            return prev_loc[1]
+        return idaapi.get_item_color(ea)
+
+    def paint(self, ea, color, prev_loc):
+        if prev_loc and prev_loc[0] == ea:
+            prev_loc[1] = color
+        else:
+            idaapi.set_item_color(ea, color)
+
+    def is_marked(self, ea):
+        return ea in self.marks
+
+    def mark(self, ea, prev_loc):
+        self.marks[ea] = self.get(ea, prev_loc)
+        self.paint(ea, self.color, prev_loc)
+        self.save()
+
+    def unmark(self, ea, prev_loc):
+        self.paint(ea, self.marks.pop(ea), prev_loc)
+        self.save()
+
+    def set_color(self, color, prev_loc):
+        self.color = color
+        for ea in self.marks:
+            self.paint(ea, color, prev_loc)
+
+    def clear(self, prev_loc):
+        for ea, col in self.marks.items():
+            self.paint(ea, col, prev_loc)
+        self.marks = {}
+        self.save()
 
 
 # --------------------------------------------------------------------------
@@ -631,7 +695,7 @@ class RequestHandler(object):
     def beacon_notice(self):
         self.notice_broker('beacon')
 
-    # send a bp command (F2) to the debugger (via the broker and dispatcher)
+    # send a bp command via F2 to the debugger (via the broker and dispatcher)
     def bp_notice(self, oneshot=False):
         if not self.is_active:
             rs_log("idb isn't enabled, bp can't be set")
@@ -639,6 +703,12 @@ class RequestHandler(object):
 
         ea = idaapi.get_screen_ea()
         offset = self.rebase_remote(ea)
+
+        # F2 on a colored line toggles the breakpoint off
+        if (not oneshot) and self.bpcol and self.bpcol.is_marked(ea):
+            self.bp_delete_notice(ea, offset)
+            return
+
         cmd = "%s0x%x" % (self.dbg_dialect['bp1' if oneshot else 'bp'], offset)
 
         if (oneshot and 'oneshot_post' in self.dbg_dialect):
@@ -646,6 +716,23 @@ class RequestHandler(object):
 
         self.notice_broker("cmd", "\"cmd\":\"%s\"" % cmd)
         rs_log(">> set %s" % cmd)
+
+        if (not oneshot) and self.bpcol:
+            self.bpcol.mark(ea, self.prev_loc)
+            idaapi.refresh_idaview_anyway()
+
+    # send a bp removal command (F2 on a colored line) to the debugger
+    def bp_delete_notice(self, ea, offset):
+        self.bpcol.unmark(ea, self.prev_loc)
+        idaapi.refresh_idaview_anyway()
+
+        if 'bpdel' not in self.dbg_dialect:
+            rs_log("bp removal not supported by this debugger, delete bp at 0x%x manually" % offset)
+            return
+
+        cmd = self.dbg_dialect['bpdel'] % offset
+        self.notice_broker("cmd", "\"cmd\":\"%s\"" % cmd)
+        rs_log(">> delete bp at 0x%x" % offset)
 
     # send a hardware bp command (Ctrl-F2) to the debugger (via the broker and dispatcher)
     def hbp_notice(self, oneshot=False):
@@ -785,6 +872,7 @@ class RequestHandler(object):
         self.broker_sock = None
         self.is_active = False
         self.dbg_dialect = None
+        self.bpcol = None
         self.req_handlers = {
             'broker': self.req_broker,
             'loc': self.req_loc,
@@ -1001,6 +1089,7 @@ class SyncForm_t(PluginForm):
             return
 
         self.broker.worker.name = modname
+        self.broker.worker.bpcol = self.bpcol
 
     def init_hotkeys(self):
         hotkeys_info = (
@@ -1091,6 +1180,43 @@ class SyncForm_t(PluginForm):
     def cb_hexrays_toggle(self):
         self.cb_hexrays.toggle()
 
+    # current pc line of the running worker, if any
+    def worker_prev_loc(self):
+        if getattr(self, 'broker', None):
+            return self.broker.worker.prev_loc
+        return None
+
+    # IDA colors are 0xBBGGRR
+    def update_bpcol_btn(self):
+        col = self.bpcol.color
+        rgb = (col & 0xff, (col >> 8) & 0xff, (col >> 16) & 0xff)
+        self.btn_bpcol.setStyleSheet("background-color: #%02x%02x%02x" % rgb)
+
+    def cb_btn_bpcol(self):
+        col = self.bpcol.color
+        initial = QtGui.QColor(col & 0xff, (col >> 8) & 0xff, (col >> 16) & 0xff)
+        picked = QtWidgets.QColorDialog.getColor(initial, None, 'Breakpoint color')
+        if not picked.isValid():
+            return
+
+        color = picked.red() | (picked.green() << 8) | (picked.blue() << 16)
+        self.bpcol.set_color(color, self.worker_prev_loc())
+        self.update_bpcol_btn()
+        idaapi.refresh_idaview_anyway()
+
+        try:
+            confpath = rsconfig.save_bp_color(color)
+            rs_log("breakpoint color 0x%06x saved in %s" % (color, confpath))
+        except (IOError, OSError) as e:
+            rs_log("[-] failed to save breakpoint color: %s" % e)
+
+    # restore original colors of all breakpoint lines (debugger side untouched)
+    def cb_btn_bpcol_clear(self):
+        count = len(self.bpcol.marks)
+        self.bpcol.clear(self.worker_prev_loc())
+        idaapi.refresh_idaview_anyway()
+        rs_log("cleared %d breakpoint line(s), debugger breakpoints are left as is" % count)
+
     # issue a warning if pdb name is different from
     # the name used to register the idb to the dispatcher
     def pdb_name_warning(self, name):
@@ -1155,6 +1281,26 @@ class SyncForm_t(PluginForm):
         self.btn.setToolTip('Restart broker.')
         self.btn.clicked.connect(self.cb_btn_restart)
 
+        # create breakpoint color row: color picker and clear button
+        self.bpcol = BpColors()
+
+        self.btn_bpcol = QtWidgets.QPushButton(parent)
+        self.btn_bpcol.setFixedWidth(40)
+        self.btn_bpcol.setToolTip('Pick the color of breakpoint lines (F2).')
+        self.btn_bpcol.clicked.connect(self.cb_btn_bpcol)
+        self.update_bpcol_btn()
+
+        btn_bpcol_clear = QtWidgets.QPushButton('Clear', parent)
+        btn_bpcol_clear.setToolTip('Restore original colors of all breakpoint lines.\n'
+                                   'Breakpoints set in the debugger are left as is.')
+        btn_bpcol_clear.clicked.connect(self.cb_btn_bpcol_clear)
+
+        bpcol_row = QtWidgets.QHBoxLayout()
+        bpcol_row.addWidget(QtWidgets.QLabel('Breakpoint color:'))
+        bpcol_row.addWidget(self.btn_bpcol)
+        bpcol_row.addWidget(btn_bpcol_clear)
+        bpcol_row.addStretch(1)
+
         # create layout
         layout = QtWidgets.QGridLayout()
         layout.addWidget(self.cb_sync)
@@ -1162,8 +1308,9 @@ class SyncForm_t(PluginForm):
         layout.addWidget(label)
         layout.addWidget(self.input)
         layout.addWidget(self.btn, 2, 2)
+        layout.addLayout(bpcol_row, 4, 0)
         layout.setColumnStretch(4, 1)
-        layout.setRowStretch(4, 1)
+        layout.setRowStretch(5, 1)
         parent.setLayout(layout)
 
         self.parser = argparse.ArgumentParser()
