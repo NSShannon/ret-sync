@@ -43,6 +43,9 @@ PLUGIN_DIR = 'retsync'
 NETNODE_STORE = "$ SYNC_STORE"
 NETNODE_INDEX = 0xFFC0DEFF
 
+# lines colored by the breakpoint feature (F2), kept in IDA database
+NETNODE_BPCOL = "$ SYNC_BP_COLORS"
+
 # networking settings
 HOST = '127.0.0.1'
 PORT = 9100
@@ -63,6 +66,10 @@ COL_CURLINE = COL_YLW
 
 # trace color, used by !bc feature
 COL_CBTRACE = COL_GREEN
+
+# breakpoint line color (F2), default value; can be changed from the plugin
+# window, it is then saved in the [COLORS] section of the .sync file
+COL_BREAKPOINT = 0x8080ff
 
 # syncrays colors, gradient of yellow
 COL_BLANK_HEX = COL_BLANK
@@ -108,7 +115,8 @@ DBG_DIALECTS = {
         'bp': 'b *',
         'hbp': 'hb *',
         'bp1': 'tb *',
-        'hbp1': 'thb *'},
+        'hbp1': 'thb *',
+        'bpdel': 'clear *0x%x'},
     'lldb': {
         'prefix': '',
         'si': 'si',
@@ -118,7 +126,13 @@ DBG_DIALECTS = {
         'bp': 'b *',
         'hbp': 'xxx',
         'bp1': 'tb *',
-        'hbp1': 'xxx'},
+        'hbp1': 'xxx',
+        # lldb can't delete a breakpoint by address, look it up by location
+        # (no quotes allowed, the command is sent inside a JSON string;
+        # lldb.target isn't set when run from the extension's poller thread)
+        'bpdel': 'script t = lldb.debugger.GetSelectedTarget(); '
+                 '[t.BreakpointDelete(b.GetID()) for b in list(t.breakpoint_iter()) '
+                 'if any(b.GetLocationAtIndex(i).GetLoadAddress() == 0x%x for i in range(b.GetNumLocations()))]'},
     'ollydbg2': {
         'prefix': '',
         'si': 'si',
@@ -245,29 +259,95 @@ def get_python_interpreter():
     raise RuntimeError
 
 
+# first .sync file found (idb directory, then user's home), None otherwise
+def find_configuration():
+    for loc in ('IDB_PATH', 'USERPROFILE', 'HOME'):
+        if loc in os.environ:
+            confpath = os.path.join(os.path.realpath(os.environ[loc]), '.sync')
+            if os.path.exists(confpath):
+                return confpath
+
+    return None
+
+
 # this function is used by the main plugin, the broker and the dispatcher
 def load_configuration(name=None):
     user_conf = namedtuple('user_conf', 'host port alias path')
     host, port, alias, path = HOST, PORT, None, None
 
-    for loc in ('IDB_PATH', 'USERPROFILE', 'HOME'):
-        if loc in os.environ:
-            confpath = os.path.join(os.path.realpath(os.environ[loc]), '.sync')
+    confpath = find_configuration()
+    if confpath:
+        config = SafeConfigParser({'host': HOST, 'port': PORT})
+        config.read(confpath)
 
-            if os.path.exists(confpath):
-                config = SafeConfigParser({'host': HOST, 'port': PORT})
-                config.read(confpath)
+        if config.has_section('INTERFACE'):
+            host = config.get('INTERFACE', 'host')
+            port = config.getint('INTERFACE', 'port')
 
-                if config.has_section('INTERFACE'):
-                    host = config.get('INTERFACE', 'host')
-                    port = config.getint('INTERFACE', 'port')
+        if name and config.has_option('ALIASES', name):
+            alias_ = config.get('ALIASES', name)
+            if alias_ != "":
+                alias = alias_
 
-                if name and config.has_option('ALIASES', name):
-                    alias_ = config.get('ALIASES', name)
-                    if alias_ != "":
-                        alias = alias_
-
-                path = confpath
-                break
+        path = confpath
 
     return user_conf(host, port, alias, path)
+
+
+# breakpoint line color from the [COLORS] section, default value otherwise
+def load_bp_color():
+    confpath = find_configuration()
+    if confpath:
+        config = SafeConfigParser()
+        config.read(confpath)
+
+        if config.has_option('COLORS', 'breakpoint'):
+            value = config.get('COLORS', 'breakpoint')
+            try:
+                return int(value.split()[0], 0)
+            except (ValueError, IndexError):
+                rs_log("invalid breakpoint color \"%s\" in %s" % (value, confpath))
+
+    return COL_BREAKPOINT
+
+
+# save breakpoint line color in the [COLORS] section of the .sync file in use
+# (created in user's home if none), the file is edited line by line so that
+# comments and other sections are preserved
+def save_bp_color(color):
+    confpath = find_configuration()
+    if not confpath:
+        confpath = os.path.join(os.path.expanduser('~'), '.sync')
+
+    lines = []
+    if os.path.exists(confpath):
+        with open(confpath, 'r') as fd:
+            lines = fd.readlines()
+
+    entry = "breakpoint=0x%06x\n" % color
+    section, sec_idx, key_idx = None, None, None
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('[') and stripped.endswith(']'):
+            section = stripped[1:-1].strip()
+            if section == 'COLORS':
+                sec_idx = i
+        elif section == 'COLORS' and stripped.split('=')[0].strip().lower() == 'breakpoint':
+            key_idx = i
+
+    if key_idx is not None:
+        lines[key_idx] = entry
+    elif sec_idx is not None:
+        lines.insert(sec_idx + 1, entry)
+    else:
+        if lines and not lines[-1].endswith('\n'):
+            lines[-1] += '\n'
+        if lines:
+            lines.append('\n')
+        lines += ['[COLORS]\n', entry]
+
+    with open(confpath, 'w') as fd:
+        fd.writelines(lines)
+
+    return confpath
