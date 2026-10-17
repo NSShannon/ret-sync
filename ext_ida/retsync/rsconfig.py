@@ -123,9 +123,11 @@ DBG_DIALECTS = {
         'so': 'ni',
         'go': 'continue',
         'run': 'run',
-        'bp': 'b *',
+        # use the full command, not the b/tb aliases: lldbinit overrides
+        # b with its own command that doesn't understand the *addr syntax
+        'bp': 'breakpoint set -a ',
         'hbp': 'xxx',
-        'bp1': 'tb *',
+        'bp1': 'breakpoint set -o true -a ',
         'hbp1': 'xxx',
         # lldb can't delete a breakpoint by address, look it up by location
         # (no quotes allowed, the command is sent inside a JSON string;
@@ -214,6 +216,11 @@ PY_LINUX_DEFAULTS = ("/usr/bin",)
 
 # retsync plugin needs a Python interpreter to run broker and dispatcher
 def get_python_interpreter():
+
+    # gotta fix this - shannon
+    #return "/Users/shannon/.pyenv/shims/python"
+    return "/Users/shannon/.pyenv/versions/3.13.2/bin/python"
+
     # when available, use spawn module to search through PATH
     if spawn_module:
         interpreter = distutils.spawn.find_executable('python')
